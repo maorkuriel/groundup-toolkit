@@ -1,0 +1,27 @@
+{
+  "name": "vc-automation",
+  "version": "1.0.0",
+  "description": "VC workflow automation tools including meeting notes processor and founder research",
+  "author": "GroundUp Toolkit",
+  "executables": [
+    {
+      "name": "meeting-notes-to-crm",
+      "description": "Process meeting notes and update HubSpot CRM automatically",
+      "triggers": [
+        "process.*meeting.*notes",
+        "log.*meeting",
+        "meeting.*summary",
+        "update.*crm.*meeting"
+      ]
+    },
+    {
+      "name": "research-founder",
+      "description": "Research a founder and generate comprehensive due diligence report",
+      "triggers": [
+        "research.*founder",
+        "founder.*research",
+        "due.*diligence.*founder"
+      ]
+    }
+  ]
+}

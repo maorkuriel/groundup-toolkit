@@ -1,0 +1,36 @@
+#!/bin/bash
+# Download Google Doc and output as text
+# Usage: download-google-doc <document-url-or-id>
+
+set -e
+
+# Extract document ID from URL if full URL is provided
+DOC_INPUT="$1"
+
+if [[ "$DOC_INPUT" == *"docs.google.com"* ]]; then
+    # Extract ID from URL: https://docs.google.com/document/d/DOCUMENT_ID/edit...
+    DOC_ID=$(echo "$DOC_INPUT" | grep -oP "(?<=/d/)[^/]+")
+else
+    # Assume input is already the document ID
+    DOC_ID="$DOC_INPUT"
+fi
+
+if [ -z "$DOC_ID" ]; then
+    echo "Error: Could not extract document ID from: $DOC_INPUT"
+    exit 1
+fi
+
+# Set gog password and account
+export GOG_KEYRING_PASSWORD="${GOG_KEYRING_PASSWORD}"
+GOG_ACCOUNT="${GOG_ACCOUNT:-assistant@yourcompany.com}"
+
+# Download document as text
+OUTPUT_FILE="/tmp/google-doc-${DOC_ID}.txt"
+
+gog drive download "$DOC_ID" \
+    --account "$GOG_ACCOUNT" \
+    --format txt \
+    --out "$OUTPUT_FILE" >&2
+
+# Output the content
+cat "$OUTPUT_FILE"

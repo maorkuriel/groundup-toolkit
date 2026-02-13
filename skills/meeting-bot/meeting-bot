@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""
+Meeting Bot - Processes completed meeting recordings and extracts action items
+GroundUp Toolkit
+
+Checks Google Drive for new meeting recordings, downloads transcripts,
+extracts action items with Claude AI, and emails summaries to the team.
+"""
+import os
+import sys
+import json
+import subprocess
+from datetime import datetime, timedelta
+import requests
+
+# Load toolkit config
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from lib.config import config
+
+# Configuration
+GOG_ACCOUNT = config.assistant_email
+ANTHROPIC_API_KEY = config.anthropic_api_key
+PROCESSED_MEETINGS_FILE = os.path.expanduser('~/.processed-meetings.json')
+
+TEAM_MEMBERS = {m['email']: m['name'].split()[0] for m in config.team_members}
+
+def run_gog_command(cmd):
+    """Run gog command with authentication"""
+    full_cmd = f'gog {cmd} --account {GOG_ACCOUNT} --json'
+    result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, executable='/bin/bash')
+    if result.returncode != 0:
+        print(f'Error running gog: {result.stderr}')
+        return None
+    try:
+        return json.loads(result.stdout)
+    except:
+        return result.stdout
+
+def load_processed_meetings():
+    """Load list of processed meetings"""
+    if not os.path.exists(PROCESSED_MEETINGS_FILE):
+        return {}
+    try:
+        with open(PROCESSED_MEETINGS_FILE, 'r') as f:
+            content = f.read().strip()
+            if not content:
+                return {}
+            return json.loads(content)
+    except Exception as e:
+        print(f'  ⚠️  Error loading processed meetings: {e}')
+        return {}
+
+def save_processed_meeting(meeting_id, info):
+    """Save processed meeting info"""
+    processed = load_processed_meetings()
+    processed[meeting_id] = {
+        'timestamp': datetime.now().isoformat(),
+        **info
+    }
+    with open(PROCESSED_MEETINGS_FILE, 'w') as f:
+        json.dump(processed, f, indent=2)
+
+def find_meeting_recordings():
+    """Find recent meeting recordings in Google Drive (last 7 days)"""
+    print('  🔍 Searching for meeting recordings in Google Drive...')
+    
+    # Search for video files from last 7 days
+    result = run_gog_command('drive search "mimeType: \'video\'" --max 50')
+    
+    if not result or 'files' not in result:
+        print('  ℹ️  No recordings found')
+        return []
+    
+    recordings = []
+    now = datetime.now()
+    cutoff = now - timedelta(days=7)
+    
+    for file in result['files']:
+        try:
+            # Parse created time
+            created_str = file.get('createdTime', '')
+            if not created_str:
+                continue
+                
+            created = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
+            created_naive = created.replace(tzinfo=None)
+            
+            # Only recent recordings
+            if created_naive < cutoff:
+                continue
+            
+            # Check if it's a meeting recording (usually contains "Meet" or "GMT" in name)
+            name = file.get('name', '')
+            if 'Meet' not in name and 'GMT' not in name and 'meeting' not in name.lower():
+                continue
+            
+            recordings.append({
+                'id': file['id'],
+                'name': name,
+                'created': created_naive,
+                'mimeType': file.get('mimeType', '')
+            })
+            
+        except Exception as e:
+            continue
+    
+    return recordings
+
+def get_transcript_from_recording(recording_id, recording_name):
+    """Get transcript for a meeting recording"""
+    print(f'  📝 Looking for transcript...')
+    
+    # Search for associated transcript file (Google Meet creates .sbv or .vtt files)
+    base_name = recording_name.rsplit('.', 1)[0]  # Remove extension
+    
+    result = run_gog_command(f'drive search "name: \'{base_name}\'" --max 20')
+    
+    if not result or 'files' not in result:
+        print('  ℹ️  No transcript file found')
+        return None
+    
+    # Look for transcript files (.sbv, .vtt, or .txt)
+    transcript_file = None
+    for file in result['files']:
+        name = file.get('name', '').lower()
+        if any(ext in name for ext in ['.sbv', '.vtt', '.txt', 'transcript']):
+            transcript_file = file
+            break
+    
+    if not transcript_file:
+        print('  ℹ️  No transcript file found')
+        return None
+    
+    # Download transcript
+    transcript_path = f'/tmp/transcript-{transcript_file["id"]}.txt'
+    
+    try:
+        download_cmd = f'gog drive download {transcript_file["id"]} --out {transcript_path} --account {GOG_ACCOUNT}'
+        result = subprocess.run(download_cmd, shell=True, capture_output=True, text=True, executable='/bin/bash', timeout=120)
+        
+        if result.returncode != 0:
+            print(f'  ❌ Download failed: {result.stderr}')
+            return None
+        
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            transcript = f.read()
+        
+        # Clean up
+        os.remove(transcript_path)
+        
+        print(f'  ✅ Downloaded transcript ({len(transcript)} chars)')
+        return transcript
+        
+    except Exception as e:
+        print(f'  ❌ Error downloading transcript: {e}')
+        return None
+
+def extract_action_items_with_claude(transcript, meeting_name):
+    """Extract action items from transcript using Claude"""
+    print(f'  🤖 Analyzing with Claude AI...')
+    
+    if len(transcript) < 100:
+        print('  ⚠️  Transcript too short')
+        return None
+    
+    prompt = f"""Analyze this meeting transcript and extract actionable information.
+
+Meeting: {meeting_name}
+
+Extract:
+1. Brief summary (2-3 sentences)
+2. Action items with clear owners (if mentioned)
+3. Key decisions or important notes
+
+Format as markdown:
+
+## Summary
+[2-3 sentence summary]
+
+## Action Items
+- [ ] Task description - Owner: [Name] - Due: [date if mentioned]
+- [ ] Task description - Owner: [Name]
+
+## Important Notes
+- [Any important context or follow-ups]
+
+Keep it concise and actionable. Only include clear action items with owners if mentioned.
+
+Transcript:
+{transcript[:20000]}"""
+
+    try:
+        url = 'https://api.anthropic.com/v1/messages'
+        headers = {
+            'x-api-key': ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+            'content-type': 'application/json'
+        }
+
+        payload = {
+            'model': 'claude-sonnet-4-5-20250929',
+            'max_tokens': 4000,
+            'messages': [{'role': 'user', 'content': prompt}]
+        }
+
+        response = requests.post(url, headers=headers, json=payload, timeout=120)
+        response.raise_for_status()
+        result = response.json()
+        notes = result['content'][0]['text']
+
+        print(f'  ✅ Extracted action items')
+        return notes
+
+    except Exception as e:
+        print(f'  ❌ Claude error: {e}')
+        return None
+
+def send_meeting_summary_email(notes, meeting_name, meeting_date):
+    """Email meeting summary to the alert/admin email"""
+    admin_email = config.alert_email
+    admin_name = config.get_member_by_email(admin_email)
+    admin_name = admin_name['name'].split()[0] if admin_name else 'Team'
+    print(f'  📧 Emailing summary to {admin_name}...')
+
+    subject = f'Meeting Summary: {meeting_name}'
+    body = f"""Hi {admin_name},
+
+Here's the summary from {meeting_name} recorded on {meeting_date}:
+
+{notes}
+
+---
+Processed by {config.assistant_name}'s Meeting Bot
+"""
+
+    try:
+        subject_escaped = subject.replace("'", "'\\''").replace('"', '\\"')
+        body_escaped = body.replace("'", "'\\''").replace('"', '\\"')
+
+        cmd = f"gog gmail send --to '{admin_email}' --subject '{subject_escaped}' --body '{body_escaped}' --account {GOG_ACCOUNT}"
+
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, executable='/bin/bash', timeout=30)
+
+        if result.returncode == 0:
+            print(f'  ✅ Email sent to {admin_email}')
+            return True
+        else:
+            print(f'  ❌ Email failed: {result.stderr}')
+            return False
+
+    except Exception as e:
+        print(f'  ❌ Error sending email: {e}')
+        return False
+
+def main():
+    """Main entry point"""
+    print('='*60)
+    print(f'🤖 {config.assistant_name.upper()} MEETING BOT - Recording Processor')
+    print('='*60)
+    print(f'Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    print('='*60 + '\n')
+
+    if not ANTHROPIC_API_KEY:
+        print('❌ ERROR: ANTHROPIC_API_KEY not set')
+        return
+
+    # Find recent meeting recordings
+    recordings = find_meeting_recordings()
+    
+    if not recordings:
+        print('ℹ️  No new meeting recordings to process\n')
+        return
+    
+    print(f'✅ Found {len(recordings)} recording(s)\n')
+    
+    processed = load_processed_meetings()
+    processed_count = 0
+    
+    for recording in recordings:
+        recording_id = recording['id']
+        
+        # Skip if already processed
+        if recording_id in processed:
+            continue
+        
+        print(f'\n{"="*60}')
+        print(f'📹 PROCESSING: {recording["name"]}')
+        print(f'Created: {recording["created"].strftime("%Y-%m-%d %H:%M")}')
+        print(f'{"="*60}\n')
+        
+        # Get transcript
+        transcript = get_transcript_from_recording(recording_id, recording['name'])
+        
+        if not transcript:
+            print('  ⚠️  No transcript available, skipping\n')
+            save_processed_meeting(recording_id, {
+                'status': 'no_transcript',
+                'name': recording['name']
+            })
+            continue
+        
+        # Extract action items
+        notes = extract_action_items_with_claude(transcript, recording['name'])
+        
+        if not notes:
+            print('  ⚠️  Could not extract action items, skipping\n')
+            save_processed_meeting(recording_id, {
+                'status': 'extraction_failed',
+                'name': recording['name']
+            })
+            continue
+        
+        # Send email
+        meeting_date = recording['created'].strftime('%B %d, %Y at %I:%M %p')
+        send_meeting_summary_email(notes, recording['name'], meeting_date)
+        
+        # Mark as processed
+        save_processed_meeting(recording_id, {
+            'status': 'completed',
+            'name': recording['name'],
+            'date': recording['created'].isoformat()
+        })
+        
+        processed_count += 1
+        print(f'\n✅ RECORDING PROCESSED SUCCESSFULLY\n')
+    
+    print('\n' + '='*60)
+    print(f'✅ PROCESSING COMPLETE: {processed_count} new recording(s)')
+    print('='*60 + '\n')
+
+if __name__ == '__main__':
+    main()

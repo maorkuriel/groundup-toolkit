@@ -1,0 +1,62 @@
+# GroundUp Toolkit Configuration
+# Copy this to config.yaml and fill in your values
+
+assistant:
+  name: "Christina"                    # Your AI assistant's name
+  email: "christina@yourcompany.com"   # Assistant's email account (used with gog CLI)
+  whatsapp_account: "main"             # OpenClaw WhatsApp account ID
+
+team:
+  domain: "yourcompany.com"            # Your company email domain
+  members:
+    - name: "Alice Smith"
+      email: "alice@yourcompany.com"
+      phone: "+12125551001"
+      timezone: "America/New_York"
+      hubspot_owner_id: "12345678"
+      reminders_enabled: true
+
+    - name: "Bob Jones"
+      email: "bob@yourcompany.com"
+      phone: "+13105551002"
+      timezone: "America/Los_Angeles"
+      hubspot_owner_id: "87654321"
+      reminders_enabled: true
+
+    # Add more team members as needed:
+    # - name: "Full Name"
+    #   email: "name@yourcompany.com"
+    #   phone: "+1XXXXXXXXXX"          # WhatsApp-enabled number with country code
+    #   timezone: "America/New_York"   # pytz timezone string
+    #   hubspot_owner_id: "XXXXXXXX"   # From HubSpot settings > Users
+    #   reminders_enabled: true        # Set false to disable meeting reminders
+
+hubspot:
+  api_gateway: "https://api.maton.ai/hubspot"   # Maton API endpoint
+  portal_id: "12345678"                           # Your HubSpot portal/account ID (from URL)
+  pipelines:
+    - id: "default"                               # Pipeline ID from HubSpot
+      name: "VC Deal Flow"                        # Human-readable name
+      default_stage: "presentationscheduled"       # Stage ID for new deals
+      stage_names:                                 # Stage ID → display name mapping
+        presentationscheduled: "First Meeting"
+    # Add more pipelines as needed:
+    # - id: "your-pipeline-id"
+    #   name: "Another Pipeline"
+    #   default_stage: "your-stage-id"
+    #   stage_names:
+    #     "your-stage-id": "Qualified Leads"
+
+scheduling:
+  shabbat_aware: true                  # Skip Friday evening through Saturday evening
+  work_hours_start: 9                  # Don't run automations before this hour (local)
+  work_hours_end: 18                   # Don't run automations after this hour (local)
+
+notifications:
+  alert_phone: "+12125551001"          # Who to call (Twilio) when systems are down
+  alert_email: "admin@yourcompany.com" # Who to email when systems are down
+  watchdog_cooldown_minutes: 60        # Min time between repeated alerts
+
+meeting_bot:
+  camofox_port: 9377                   # Port for Camoufox headless browser
+  google_account: "christina@yourcompany.com"  # Google account for Meet

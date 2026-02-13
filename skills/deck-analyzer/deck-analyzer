@@ -1,0 +1,146 @@
+#!/bin/bash
+# Deck Analyzer OpenClaw Skill
+
+SKILL_DIR="$HOME/.openclaw/skills/deck-analyzer"
+SCRIPT="$SKILL_DIR/analyzer.py"
+
+# Check if Python script exists
+if [ ! -f "$SCRIPT" ]; then
+    echo "Error: Deck analyzer script not found at $SCRIPT"
+    exit 1
+fi
+
+# Load environment variables
+if [ -f "$HOME/.env" ]; then
+    . "$HOME/.env"
+fi
+
+# Check for ANTHROPIC_API_KEY
+if [ -z "$ANTHROPIC_API_KEY" ]; then
+    echo "Error: ANTHROPIC_API_KEY not set"
+    echo "Please set it in your environment or ~/.env file"
+    exit 1
+fi
+
+# Get action
+ACTION="${1:-help}"
+shift
+
+# Execute the appropriate action
+case "$ACTION" in
+    analyze)
+        if [ $# -lt 1 ]; then
+            echo "Usage: deck-analyzer analyze <DECK_URL> [SENDER_EMAIL]"
+            echo ""
+            echo "Examples:"
+            echo "  deck-analyzer analyze https://docsend.com/view/abc123"
+            echo "  deck-analyzer analyze https://docs.google.com/presentation/d/abc"
+            exit 1
+        fi
+        
+        DECK_URL="$1"
+        SENDER_EMAIL="${2:-}"
+        
+        echo "🔍 Analyzing deck: $DECK_URL"
+        echo ""
+        
+        # Create a temporary Python script to use the analyzer functions
+        python3 << PYTHON
+import sys
+sys.path.insert(0, '$SKILL_DIR')
+from analyzer import fetch_deck_content, analyze_deck_with_claude, format_company_description
+import json
+
+deck_url = "$DECK_URL"
+sender_email = "$SENDER_EMAIL"
+
+print("  📥 Fetching deck content...")
+content = fetch_deck_content(deck_url, sender_email)
+
+if not content:
+    print("  ❌ Failed to fetch deck content")
+    sys.exit(1)
+
+print("  🤖 Analyzing with Claude AI...")
+info = analyze_deck_with_claude(content)
+
+if not info:
+    print("  ❌ Failed to analyze deck")
+    sys.exit(1)
+
+print("  ✅ Analysis complete!\n")
+print("=" * 60)
+print("EXTRACTED INFORMATION (JSON)")
+print("=" * 60)
+print(json.dumps(info, indent=2))
+print("\n" + "=" * 60)
+print("HUBSPOT-FORMATTED DESCRIPTION")
+print("=" * 60)
+print(format_company_description(info))
+PYTHON
+        ;;
+    
+    extract-links)
+        if [ -t 0 ]; then
+            # stdin is a terminal, expect file argument
+            if [ $# -lt 1 ]; then
+                echo "Usage: deck-analyzer extract-links <TEXT_FILE>"
+                echo "   Or: echo 'text with links' | deck-analyzer extract-links"
+                exit 1
+            fi
+            TEXT=$(cat "$1")
+        else
+            # stdin is piped/redirected
+            TEXT=$(cat)
+        fi
+        
+        python3 << PYTHON
+import sys
+sys.path.insert(0, '$SKILL_DIR')
+from analyzer import extract_deck_links
+
+text = """$TEXT"""
+links = extract_deck_links(text)
+
+if links:
+    print("Found {} deck link(s):".format(len(links)))
+    for link in links:
+        print("  • {}".format(link))
+else:
+    print("No deck links found")
+PYTHON
+        ;;
+    
+    test)
+        echo "🧪 Running deck analyzer test..."
+        echo ""
+        /usr/bin/python3 "$SCRIPT"
+        ;;
+    
+    help|--help|-h)
+        echo "Deck Analyzer - Extract structured information from pitch decks"
+        echo ""
+        echo "Usage: deck-analyzer <ACTION> [ARGS]"
+        echo ""
+        echo "Actions:"
+        echo "  analyze <URL> [EMAIL]  - Analyze a pitch deck from URL"
+        echo "  extract-links <FILE>   - Extract deck links from text"
+        echo "  test                   - Run test analysis with sample deck"
+        echo "  help                   - Show this help message"
+        echo ""
+        echo "Examples:"
+        echo "  deck-analyzer analyze https://docsend.com/view/abc123"
+        echo "  deck-analyzer extract-links email.txt"
+        echo "  echo 'Check our deck: https://...' | deck-analyzer extract-links"
+        echo "  deck-analyzer test"
+        echo ""
+        echo "Environment required:"
+        echo "  ANTHROPIC_API_KEY - Claude API key for analysis"
+        ;;
+    
+    *)
+        echo "Unknown action: $ACTION"
+        echo "Run 'deck-analyzer help' for usage information"
+        exit 1
+        ;;
+esac

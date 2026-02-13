@@ -1,0 +1,12 @@
+[
+  {
+    "name": "SID",
+    "value": "YOUR_COOKIE_VALUE_HERE",
+    "domain": ".google.com",
+    "path": "/",
+    "expires": 1800000000,
+    "httpOnly": false,
+    "secure": false,
+    "session": false
+  }
+]

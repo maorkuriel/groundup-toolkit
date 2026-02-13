@@ -1,0 +1,140 @@
+#!/bin/bash
+# ping-teammate — Call a team member via Twilio when someone pings them on WhatsApp
+# Usage: ping-teammate <target-name> <sender-phone>
+# Example: ping-teammate Alice +15551234567
+
+set -euo pipefail
+source "$HOME/.env" 2>/dev/null || true
+
+# --- Team phone mappings ---
+# TODO: Populate from config.yaml - see config.example.yaml for format
+# Generate team-phones.json from config.yaml with:
+#   python3 -c "import yaml,json; c=yaml.safe_load(open('config.yaml')); \
+#     print(json.dumps({m['name'].lower(): m['phone'] for m in c['team']['members']}))" > team-phones.json
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOLKIT_ROOT="${TOOLKIT_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+TEAM_JSON="${TOOLKIT_ROOT}/team-phones.json"
+
+if [ ! -f "$TEAM_JSON" ]; then
+    # Auto-generate team-phones.json from config.yaml if possible
+    if [ -f "${TOOLKIT_ROOT}/config.yaml" ]; then
+        python3 -c "
+import yaml, json
+c = yaml.safe_load(open('${TOOLKIT_ROOT}/config.yaml'))
+members = c.get('team', {}).get('members', [])
+name_to_phone = {m['name'].lower(): m['phone'] for m in members}
+phone_to_name = {m['phone']: m['name'] for m in members}
+json.dump({'name_to_phone': name_to_phone, 'phone_to_name': phone_to_name}, open('${TEAM_JSON}', 'w'), indent=2)
+" 2>/dev/null
+    fi
+fi
+
+if [ ! -f "$TEAM_JSON" ]; then
+    echo "ERROR: Team phone mappings not found."
+    echo "Generate team-phones.json from config.yaml or create it manually."
+    echo "See config.example.yaml for format."
+    exit 1
+fi
+
+TARGET_NAME="${1:-}"
+SENDER_PHONE="${2:-}"
+
+if [ -z "$TARGET_NAME" ] || [ -z "$SENDER_PHONE" ]; then
+    echo "Usage: ping-teammate <target-name> <sender-phone>"
+    exit 1
+fi
+
+# Normalize target name to lowercase for matching
+TARGET_LOWER=$(echo "$TARGET_NAME" | tr '[:upper:]' '[:lower:]')
+
+# Look up team members from generated JSON
+TARGET_PHONE=$(python3 -c "import json; d=json.load(open('${TEAM_JSON}')); print(d['name_to_phone'].get('${TARGET_LOWER}', ''))" 2>/dev/null || echo "")
+SENDER_NAME=$(python3 -c "import json; d=json.load(open('${TEAM_JSON}')); print(d['phone_to_name'].get('${SENDER_PHONE}', ''))" 2>/dev/null || echo "")
+
+# Validate sender is a team member
+if [ -z "$SENDER_NAME" ]; then
+    echo "ERROR: Sender $SENDER_PHONE is not a team member. Only team members can use ping."
+    exit 1
+fi
+
+# Look up target phone
+if [ -z "$TARGET_PHONE" ]; then
+    VALID_NAMES=$(python3 -c "import json; d=json.load(open('${TEAM_JSON}')); print(', '.join(n.title() for n in d['name_to_phone'].keys()))" 2>/dev/null || echo "(check team-phones.json)")
+    echo "ERROR: Unknown team member '$TARGET_NAME'. Valid names: $VALID_NAMES"
+    exit 1
+fi
+
+# Don't let someone ping themselves
+if [ "$SENDER_PHONE" = "$TARGET_PHONE" ]; then
+    echo "You can't ping yourself, $SENDER_NAME!"
+    exit 0
+fi
+
+# Proper case for target name
+TARGET_PROPER="${TARGET_NAME^}"
+
+echo "Calling $TARGET_PROPER now..."
+
+# Call via Twilio
+TWIML="<Response><Say voice=\"alice\">Hey ${TARGET_PROPER}, ${SENDER_NAME} is trying to reach you. Please check your WhatsApp or join the meeting. This is urgent.</Say><Pause length=\"2\"/><Say voice=\"alice\">Again, ${TARGET_PROPER}, ${SENDER_NAME} needs you right now. Please respond.</Say></Response>"
+
+RESPONSE=$(curl -s -X POST \
+    "https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json" \
+    -u "${TWILIO_API_KEY_SID}:${TWILIO_API_KEY_SECRET}" \
+    -d "To=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$TARGET_PHONE'))")" \
+    -d "From=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$TWILIO_FROM_NUMBER'))")" \
+    --data-urlencode "Twiml=${TWIML}")
+
+# Extract call SID
+CALL_SID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sid',''))" 2>/dev/null || echo "")
+
+if [ -z "$CALL_SID" ]; then
+    ERROR_MSG=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message','unknown error'))" 2>/dev/null || echo "Twilio error")
+    echo "Failed to call $TARGET_PROPER: $ERROR_MSG"
+    exit 1
+fi
+
+echo "Ringing $TARGET_PROPER now. Waiting to see if they pick up..."
+
+# Poll Twilio for call outcome (check every 5s, up to 60s)
+FINAL_STATUS=""
+for i in $(seq 1 12); do
+    sleep 5
+    STATUS_RESPONSE=$(curl -s \
+        "https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${CALL_SID}.json" \
+        -u "${TWILIO_API_KEY_SID}:${TWILIO_API_KEY_SECRET}")
+    CALL_STATUS=$(echo "$STATUS_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+    CALL_DURATION=$(echo "$STATUS_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('duration','0'))" 2>/dev/null || echo "0")
+
+    # Terminal statuses: completed, busy, no-answer, canceled, failed
+    case "$CALL_STATUS" in
+        completed|busy|no-answer|canceled|failed)
+            FINAL_STATUS="$CALL_STATUS"
+            break
+            ;;
+    esac
+done
+
+# If we timed out polling, do one last check
+if [ -z "$FINAL_STATUS" ]; then
+    FINAL_STATUS="$CALL_STATUS"
+fi
+
+# Report back
+case "$FINAL_STATUS" in
+    completed)
+        echo "$TARGET_PROPER picked up the call (${CALL_DURATION}s)."
+        ;;
+    busy)
+        echo "$TARGET_PROPER's line was busy. They might be on another call."
+        ;;
+    no-answer)
+        echo "$TARGET_PROPER didn't pick up."
+        ;;
+    canceled|failed)
+        echo "The call to $TARGET_PROPER failed ($FINAL_STATUS)."
+        ;;
+    *)
+        echo "Call to $TARGET_PROPER status: $FINAL_STATUS. Couldn't confirm if they picked up."
+        ;;
+esac

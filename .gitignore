@@ -1,0 +1,36 @@
+# Secrets & credentials
+.env
+config.yaml
+keys/
+*.pem
+*.key
+google_token.json
+google_client_web.json
+google-cookies.json
+session.json
+
+# Node
+node_modules/
+package-lock.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Data & state
+*.db
+*.sqlite
+*.log
+*-state
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+.claude/

@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""
+Automatically move deals to Pass stage based on email feedback
+
+Usage:
+  deal-pass-automation --email-id <thread_id>
+  deal-pass-automation --deal-id <deal_id> --reason "Not a fit"
+
+Examples:
+  deal-pass-automation --email-id "19c3caf0a3d62fdf"
+  deal-pass-automation --deal-id "55717163650" --reason "Not a fit for us"
+
+The script will:
+1. Extract deal/company from email thread
+2. Find deal in HubSpot
+3. Move to "closedlost" stage with pass reason
+4. Send confirmation email to sender
+"""
+
+import sys
+import os
+import json
+import requests
+import subprocess
+from datetime import datetime
+
+# Load shared config
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from lib.config import config
+
+# Configuration
+MATON_API_URL = "https://gateway.maton.ai/hubspot"
+MATON_API_KEY = os.getenv("MATON_API_KEY")
+GOG_KEYRING_PASSWORD = os.getenv("GOG_KEYRING_PASSWORD", "")
+ASSISTANT_EMAIL = config.assistant_email
+
+if not MATON_API_KEY:
+    print("Error: MATON_API_KEY not set")
+    sys.exit(1)
+
+
+def get_email_thread(thread_id):
+    """Get email thread using gog"""
+    try:
+        cmd = [
+            "gog", "gmail", "thread", "get", thread_id,
+            "--account", ASSISTANT_EMAIL,
+            "--format", "json"
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GOG_KEYRING_PASSWORD": GOG_KEYRING_PASSWORD}
+        )
+
+        if result.returncode != 0:
+            print(f"Error fetching thread: {result.stderr}")
+            return None
+
+        return json.loads(result.stdout)
+    except Exception as e:
+        print(f"Error getting email thread: {e}")
+        return None
+
+
+def extract_company_from_thread(thread):
+    """Extract company name from email thread"""
+    # Look through messages for company mentions
+    # Usually in subject or first few messages
+
+    if not thread or "messages" not in thread:
+        return None
+
+    # Get subject from first message
+    first_msg = thread["messages"][0]
+    subject = ""
+
+    for header in first_msg.get("payload", {}).get("headers", []):
+        if header["name"].lower() == "subject":
+            subject = header["value"]
+            break
+
+    # Simple extraction - remove common prefixes
+    subject = subject.replace("Re: ", "").replace("Fwd: ", "").strip()
+
+    # If subject has company name pattern, extract it
+    # Otherwise return the subject itself
+    return subject
+
+
+def search_hubspot_deal(company_name):
+    """Search for deal in HubSpot"""
+    headers = {
+        "Authorization": f"Bearer {MATON_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # Search for company
+    search_url = f"{MATON_API_URL}/crm/v3/objects/companies/search"
+    payload = {
+        "filterGroups": [{
+            "filters": [{
+                "propertyName": "name",
+                "operator": "CONTAINS_TOKEN",
+                "value": company_name
+            }]
+        }],
+        "properties": ["name"],
+        "limit": 5
+    }
+
+    response = requests.post(search_url, headers=headers, json=payload)
+
+    if response.status_code != 200:
+        print(f"Error searching companies: {response.status_code}")
+        return None
+
+    companies = response.json().get("results", [])
+
+    if not companies:
+        print(f"No company found matching '{company_name}'")
+        return None
+
+    company = companies[0]
+    company_id = company["id"]
+    company_name = company["properties"]["name"]
+
+    print(f"✓ Found company: {company_name} (ID: {company_id})")
+
+    # Get deals for this company
+    assoc_url = f"{MATON_API_URL}/crm/v4/objects/companies/{company_id}/associations/deals"
+    response = requests.get(assoc_url, headers=headers)
+
+    if response.status_code != 200:
+        print(f"Error fetching deals: {response.status_code}")
+        return None
+
+    associations = response.json().get("results", [])
+
+    if not associations:
+        print(f"No deals found for {company_name}")
+        return None
+
+    # Get first deal
+    deal_id = associations[0]["toObjectId"]
+
+    # Fetch deal details
+    deal_url = f"{MATON_API_URL}/crm/v3/objects/deals/{deal_id}"
+    response = requests.get(deal_url, headers=headers)
+
+    if response.status_code != 200:
+        return None
+
+    deal = response.json()
+
+    return {
+        "deal_id": deal_id,
+        "deal_name": deal["properties"].get("dealname", "Unnamed"),
+        "company_name": company_name,
+        "current_stage": deal["properties"].get("dealstage", "unknown")
+    }
+
+
+def move_deal_to_pass(deal_id, reason):
+    """Move deal to closedlost (Pass) stage"""
+    headers = {
+        "Authorization": f"Bearer {MATON_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    update_url = f"{MATON_API_URL}/crm/v3/objects/deals/{deal_id}"
+
+    # Create note with reason instead of using property
+    timestamp_ms = int(datetime.now().timestamp() * 1000)
+
+    properties = {
+        "dealstage": "closedlost",
+        "closedate": datetime.now().strftime("%Y-%m-%d")
+    }
+
+    response = requests.patch(update_url, headers=headers, json={"properties": properties})
+
+    if response.status_code != 200:
+        print(f"Error updating deal: {response.status_code}")
+        print(response.text)
+        return False
+
+    print(f"✓ Moved deal to Pass stage")
+
+    # Add note explaining the pass
+    note_url = f"{MATON_API_URL}/crm/v3/objects/notes"
+    note_payload = {
+        "properties": {
+            "hs_timestamp": str(timestamp_ms),
+            "hs_note_body": f"Deal moved to Pass\n\nReason: {reason}\nDate: {datetime.now().strftime('%Y-%m-%d')}"
+        },
+        "associations": [{
+            "to": {"id": deal_id},
+            "types": [{
+                "associationCategory": "HUBSPOT_DEFINED",
+                "associationTypeId": 214
+            }]
+        }]
+    }
+
+    note_response = requests.post(note_url, headers=headers, json=note_payload)
+
+    if note_response.status_code in [200, 201]:
+        print(f"✓ Added note with pass reason")
+
+    return True
+
+
+def send_confirmation_email(to_email, deal_name, company_name):
+    """Send confirmation email using gog"""
+
+    subject = f"Confirmed: {company_name} moved to Pass"
+
+    body = f"""Hi,
+
+Confirmed - I've moved {company_name} to Pass in our pipeline.
+
+Deal: {deal_name}
+Status: Closed Lost (Pass)
+Reason: Not a fit
+
+Best,
+{config.assistant_name}
+"""
+
+    try:
+        cmd = [
+            "gog", "gmail", "send",
+            "--to", to_email,
+            "--subject", subject,
+            "--body", body,
+            "--account", ASSISTANT_EMAIL
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GOG_KEYRING_PASSWORD": GOG_KEYRING_PASSWORD}
+        )
+
+        if result.returncode == 0:
+            print(f"✓ Sent confirmation email to {to_email}")
+            return True
+        else:
+            print(f"Warning: Could not send confirmation email")
+            print(result.stderr)
+            return False
+
+    except Exception as e:
+        print(f"Error sending email: {e}")
+        return False
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+
+    # Parse arguments
+    email_id = None
+    deal_id = None
+    reason = "Not a fit"
+    sender_email = None
+
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i] == "--email-id":
+            email_id = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == "--deal-id":
+            deal_id = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == "--reason":
+            reason = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == "--sender":
+            sender_email = sys.argv[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    deal_info = None
+
+    # If email ID provided, extract deal from email
+    if email_id:
+        print(f"📧 Fetching email thread: {email_id}")
+        thread = get_email_thread(email_id)
+
+        if not thread:
+            print("Error: Could not fetch email thread")
+            sys.exit(1)
+
+        # Extract sender email
+        if not sender_email:
+            first_msg = thread["messages"][0]
+            for header in first_msg.get("payload", {}).get("headers", []):
+                if header["name"].lower() == "from":
+                    sender_email = header["value"]
+                    # Extract email from "Name <email>" format
+                    if "<" in sender_email:
+                        sender_email = sender_email.split("<")[1].split(">")[0]
+                    break
+
+        # Extract company/deal
+        company_name = extract_company_from_thread(thread)
+
+        if company_name:
+            print(f"🔍 Searching for deal: {company_name}")
+            deal_info = search_hubspot_deal(company_name)
+
+    # If deal ID provided directly
+    elif deal_id:
+        deal_info = {"deal_id": deal_id}
+
+    else:
+        print("Error: Must provide either --email-id or --deal-id")
+        sys.exit(1)
+
+    if not deal_info:
+        print("❌ Could not find deal")
+        sys.exit(1)
+
+    # Move deal to pass
+    print("")
+    print(f"📊 Deal: {deal_info.get('deal_name', 'Unknown')}")
+    print(f"   Company: {deal_info.get('company_name', 'Unknown')}")
+    print(f"   Current Stage: {deal_info.get('current_stage', 'Unknown')}")
+    print("")
+    print("🔄 Moving to Pass...")
+
+    success = move_deal_to_pass(deal_info["deal_id"], reason)
+
+    if not success:
+        sys.exit(1)
+
+    # Send confirmation
+    if sender_email:
+        print("")
+        print("📮 Sending confirmation...")
+        send_confirmation_email(
+            sender_email,
+            deal_info.get("deal_name", "Deal"),
+            deal_info.get("company_name", "Company")
+        )
+
+    print("")
+    print("✅ Done!")
+    print("")
+    print("📊 Summary:")
+    print(f"   - Deal moved to Pass")
+    print(f"   - Reason: {reason}")
+    if sender_email:
+        print(f"   - Confirmation sent to {sender_email}")
+
+
+if __name__ == "__main__":
+    main()

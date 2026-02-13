@@ -1,0 +1,30 @@
+#!/bin/bash
+# LinkedIn skill wrapper for OpenClaw - uses MCP bridge
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BRIDGE_SCRIPT="${SCRIPT_DIR}/linkedin-mcp-bridge.py"
+
+# Check if action is provided
+if [ -z "$1" ]; then
+    echo "Usage: linkedin <action> [args...]"
+    echo "Actions: person, company"
+    exit 1
+fi
+
+ACTION="$1"
+shift
+
+# Route to MCP bridge
+case "$ACTION" in
+    person)
+        $BRIDGE_SCRIPT person "$@"
+        ;;
+    company)
+        $BRIDGE_SCRIPT company "$@"
+        ;;
+    *)
+        echo "Unknown action: $ACTION"
+        echo "Available actions: person, company"
+        exit 1
+        ;;
+esac

@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""
+Process meeting notes and update HubSpot CRM automatically
+
+Usage:
+  meeting-notes-to-crm <notes_text>
+  meeting-notes-to-crm --file <file_path>
+  echo "notes" | meeting-notes-to-crm --stdin
+
+Examples:
+  meeting-notes-to-crm "Met with Acme Corp CEO. Great traction..."
+  meeting-notes-to-crm --file ~/meeting-notes.txt
+
+The script will:
+1. Extract company name, key points, action items, follow-ups
+2. Find the deal in HubSpot
+3. Update the deal with notes
+4. Create follow-up reminders
+"""
+
+import sys
+import os
+import json
+import requests
+from datetime import datetime, timedelta
+import subprocess
+
+# Load shared config
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from lib.config import config
+
+# Configuration
+MATON_API_URL = "https://gateway.maton.ai/hubspot"
+MATON_API_KEY = os.getenv("MATON_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+if not MATON_API_KEY:
+    print("Error: MATON_API_KEY not set")
+    sys.exit(1)
+
+if not ANTHROPIC_API_KEY:
+    print("Error: ANTHROPIC_API_KEY not set")
+    sys.exit(1)
+
+
+def call_claude(prompt, system_prompt=""):
+    """Call Claude API to process notes"""
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+
+    if system_prompt:
+        payload["system"] = system_prompt
+
+    response = requests.post(url, headers=headers, json=payload)
+
+    if response.status_code != 200:
+        print(f"Error calling Claude API: {response.status_code}")
+        print(response.text)
+        sys.exit(1)
+
+    result = response.json()
+    return result["content"][0]["text"]
+
+
+def extract_meeting_info(notes_text):
+    """Extract structured information from meeting notes"""
+
+    system_prompt = """You are an expert at analyzing VC meeting notes and extracting structured information.
+Extract key information and return ONLY valid JSON, no markdown, no explanations."""
+
+    prompt = f"""Analyze these meeting notes and extract structured information:
+
+MEETING NOTES:
+{notes_text}
+
+Return JSON in this exact format:
+{{
+  "company_name": "Company Name",
+  "key_points": [
+    "Point 1",
+    "Point 2",
+    "Point 3"
+  ],
+  "action_items": [
+    {{"task": "Action description", "owner": "person", "date": "YYYY-MM-DD or null"}}
+  ],
+  "follow_up_date": "YYYY-MM-DD or null",
+  "sentiment": "positive|neutral|negative|mixed",
+  "deal_stage_suggestion": "appointmentscheduled|qualifiedtobuy|presentationscheduled|decisionmakerboughtin|contractsent|closedwon|closedlost or null",
+  "summary": "1-2 sentence summary"
+}}
+
+Important:
+- company_name: Extract the company name mentioned in notes
+- sentiment: Overall impression (positive, neutral, negative, mixed)
+- deal_stage_suggestion: Based on context, suggest appropriate stage or null if no change needed
+- If information is missing, use null
+- Return ONLY the JSON object, no markdown formatting"""
+
+    response = call_claude(prompt, system_prompt)
+
+    # Clean response - remove markdown if present
+    response = response.strip()
+    if response.startswith("```json"):
+        response = response[7:]
+    if response.startswith("```"):
+        response = response[3:]
+    if response.endswith("```"):
+        response = response[:-3]
+    response = response.strip()
+
+    try:
+        return json.loads(response)
+    except json.JSONDecodeError as e:
+        print(f"Error parsing Claude response: {e}")
+        print(f"Response was: {response}")
+        sys.exit(1)
+
+
+def search_hubspot_deal(company_name):
+    """Search for a deal in HubSpot by company name"""
+
+    # First, search for the company
+    search_url = f"{MATON_API_URL}/crm/v3/objects/companies/search"
+    headers = {
+        "Authorization": f"Bearer {MATON_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "filterGroups": [{
+            "filters": [{
+                "propertyName": "name",
+                "operator": "CONTAINS_TOKEN",
+                "value": company_name
+            }]
+        }],
+        "properties": ["name"],
+        "limit": 5
+    }
+
+    response = requests.post(search_url, headers=headers, json=payload)
+
+    if response.status_code != 200:
+        print(f"Error searching companies: {response.status_code}")
+        print(response.text)
+        return None
+
+    companies = response.json().get("results", [])
+
+    if not companies:
+        print(f"No company found matching '{company_name}'")
+        return None
+
+    company = companies[0]
+    company_id = company["id"]
+    print(f"✓ Found company: {company['properties']['name']} (ID: {company_id})")
+
+    # Now find deals associated with this company
+    associations_url = f"{MATON_API_URL}/crm/v4/objects/companies/{company_id}/associations/deals"
+
+    response = requests.get(associations_url, headers=headers)
+
+    if response.status_code != 200:
+        print(f"Error fetching associations: {response.status_code}")
+        return None
+
+    associations = response.json().get("results", [])
+
+    if not associations:
+        print(f"No deals found for company '{company_name}'")
+        return None
+
+    # Get the first deal (most recent)
+    deal_id = associations[0]["toObjectId"]
+
+    # Fetch deal details
+    deal_url = f"{MATON_API_URL}/crm/v3/objects/deals/{deal_id}"
+    response = requests.get(deal_url, headers=headers)
+
+    if response.status_code != 200:
+        return None
+
+    deal = response.json()
+    print(f"✓ Found deal: {deal['properties'].get('dealname', 'Unnamed')} (ID: {deal_id})")
+
+    return deal
+
+
+def update_deal(deal_id, info):
+    """Update deal in HubSpot with meeting notes"""
+
+    headers = {
+        "Authorization": f"Bearer {MATON_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # Prepare notes text
+    notes_text = f"""Meeting Notes - {datetime.now().strftime('%Y-%m-%d')}
+
+SUMMARY:
+{info['summary']}
+
+KEY POINTS:
+"""
+    for point in info['key_points']:
+        notes_text += f"• {point}\n"
+
+    if info['action_items']:
+        notes_text += "\nACTION ITEMS:\n"
+        for item in info['action_items']:
+            owner = f" ({item['owner']})" if item['owner'] else ""
+            date = f" - Due: {item['date']}" if item['date'] else ""
+            notes_text += f"• {item['task']}{owner}{date}\n"
+
+    if info['follow_up_date']:
+        notes_text += f"\nFOLLOW-UP: {info['follow_up_date']}\n"
+
+    notes_text += f"\nSentiment: {info['sentiment'].title()}"
+
+    # Update deal
+    update_url = f"{MATON_API_URL}/crm/v3/objects/deals/{deal_id}"
+
+    properties = {
+        "hs_lastmodifieddate": datetime.now().isoformat()
+    }
+
+    # Update stage if suggested
+    if info.get('deal_stage_suggestion'):
+        properties['dealstage'] = info['deal_stage_suggestion']
+        print(f"✓ Updating deal stage to: {info['deal_stage_suggestion']}")
+
+    # Create note as engagement
+    note_url = f"{MATON_API_URL}/crm/v3/objects/notes"
+    timestamp_ms = int(datetime.now().timestamp() * 1000)
+    note_payload = {
+        "properties": {
+            "hs_timestamp": str(timestamp_ms),
+            "hs_note_body": notes_text
+        },
+        "associations": [{
+            "to": {"id": deal_id},
+            "types": [{
+                "associationCategory": "HUBSPOT_DEFINED",
+                "associationTypeId": 214
+            }]
+        }]
+    }
+
+    response = requests.post(note_url, headers=headers, json=note_payload)
+
+    if response.status_code not in [200, 201]:
+        print(f"Warning: Could not create note: {response.status_code}")
+        print(response.text)
+    else:
+        print("✓ Added note to deal")
+
+    # Update deal properties if stage changed
+    if properties.get('dealstage'):
+        response = requests.patch(update_url, headers=headers, json={"properties": properties})
+
+        if response.status_code != 200:
+            print(f"Warning: Could not update deal stage: {response.status_code}")
+        else:
+            print("✓ Updated deal stage")
+
+    return True
+
+
+def create_calendar_reminder(info, company_name):
+    """Create calendar reminder for follow-up if needed"""
+
+    if not info.get('follow_up_date'):
+        return
+
+    try:
+        # Use Google Calendar to create reminder
+        title = f"Follow up: {company_name}"
+        date = info['follow_up_date']
+        time = "09:00"
+        phone = config.alert_phone
+
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'google-workspace', 'create-calendar-event')
+
+        cmd = [
+            "python3", script_path,
+            phone, title, date, time, "30"
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            print(f"✓ Created follow-up reminder for {date}")
+        else:
+            print(f"Warning: Could not create calendar reminder")
+    except Exception as e:
+        print(f"Warning: Could not create calendar reminder: {e}")
+
+
+def main():
+    # Parse arguments
+    notes_text = ""
+
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+
+    if sys.argv[1] == "--file":
+        if len(sys.argv) < 3:
+            print("Error: --file requires a file path")
+            sys.exit(1)
+
+        file_path = sys.argv[2]
+        try:
+            with open(file_path, 'r') as f:
+                notes_text = f.read()
+        except FileNotFoundError:
+            print(f"Error: File not found: {file_path}")
+            sys.exit(1)
+
+    elif sys.argv[1] == "--stdin":
+        notes_text = sys.stdin.read()
+
+    else:
+        # All arguments are the notes
+        notes_text = ' '.join(sys.argv[1:])
+
+    if not notes_text.strip():
+        print("Error: No notes provided")
+        sys.exit(1)
+
+    print("📝 Processing meeting notes...")
+    print("")
+
+    # Extract information
+    info = extract_meeting_info(notes_text)
+
+    print(f"Company: {info['company_name']}")
+    print(f"Sentiment: {info['sentiment'].title()}")
+    print(f"Summary: {info['summary']}")
+    print("")
+
+    # Search for deal
+    deal = search_hubspot_deal(info['company_name'])
+
+    if not deal:
+        print("")
+        print("⚠️  No deal found. You can:")
+        print("  1. Check company name spelling")
+        print("  2. Create deal manually in HubSpot")
+        print("  3. Use /deal-logger to create from email")
+        sys.exit(0)
+
+    # Update deal
+    print("")
+    print("💾 Updating HubSpot...")
+    update_deal(deal['id'], info)
+
+    # Create follow-up reminder
+    if info.get('follow_up_date'):
+        print("")
+        create_calendar_reminder(info, info['company_name'])
+
+    print("")
+    print("✅ Done! Meeting notes logged to HubSpot")
+    print("")
+    print("📊 Summary:")
+    print(f"  - Company: {info['company_name']}")
+    print(f"  - Deal ID: {deal['id']}")
+    print(f"  - Key points: {len(info['key_points'])}")
+    print(f"  - Action items: {len(info['action_items'])}")
+    if info.get('follow_up_date'):
+        print(f"  - Follow-up: {info['follow_up_date']}")
+
+
+if __name__ == "__main__":
+    main()

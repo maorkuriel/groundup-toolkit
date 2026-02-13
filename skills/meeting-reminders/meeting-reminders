@@ -1,0 +1,35 @@
+#!/bin/bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT="$SCRIPT_DIR/reminders.py"
+
+# Load environment variables
+if [ -f "$HOME/.env" ]; then
+    . "$HOME/.env"
+fi
+
+# Parse action
+ACTION="${1:-reminders}"
+
+case "$ACTION" in
+    reminders)
+        # Normal reminder processing
+        /usr/bin/python3 "$SCRIPT"
+        ;;
+
+    next-meeting)
+        # Query next meeting by email or phone
+        IDENTIFIER="${2:-}"
+        if [ -z "$IDENTIFIER" ]; then
+            echo "Usage: meeting-reminders next-meeting <email|phone>"
+            exit 1
+        fi
+
+        /usr/bin/python3 "$SCRIPT" query "$IDENTIFIER"
+        ;;
+
+    *)
+        echo "Usage: meeting-reminders [reminders|next-meeting <email|phone>]"
+        exit 1
+        ;;
+esac

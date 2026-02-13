@@ -1,0 +1,45 @@
+#!/bin/bash
+# Get calendar for specific user by phone number
+# Phone-to-email mappings are loaded from config.yaml via a Python helper.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TOOLKIT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Load env vars from toolkit .env if available
+if [ -f "$TOOLKIT_ROOT/.env" ]; then
+    set -a; source "$TOOLKIT_ROOT/.env" 2>/dev/null; set +a
+fi
+
+PHONE="$1"
+MAX="${2:-10}"
+
+if [ -z "$PHONE" ]; then
+    echo "Usage: calendar-for-user <phone_number> [max_events]"
+    echo "Phone-to-email mappings are defined in config.yaml"
+    exit 1
+fi
+
+# Use Python config loader to resolve phone -> email
+EMAIL=$(python3 -c "
+import sys, os
+sys.path.insert(0, '$TOOLKIT_ROOT')
+from lib.config import config
+m = config.get_member_by_phone('$PHONE')
+if m:
+    print(m['email'])
+else:
+    sys.exit(1)
+" 2>/dev/null)
+
+if [ -z "$EMAIL" ]; then
+    echo "Error: Phone number $PHONE not recognized"
+    echo "Check config.yaml for known team members"
+    exit 1
+fi
+
+# Calculate time range (next 7 days)
+START=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+END=$(date -u -d "+7 days" +"%Y-%m-%dT%H:%M:%SZ")
+
+echo "# Calendar for $EMAIL (phone: $PHONE)"
+gog calendar events "$EMAIL" --from "$START" --to "$END" --max "$MAX"

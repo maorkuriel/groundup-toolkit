@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""
+Research a founder and provide comprehensive background
+
+Usage:
+  research-founder "Founder Name"
+  research-founder "Founder Name" --company "Company Name"
+
+Examples:
+  research-founder "Sam Altman"
+  research-founder "Jane Smith" --company "Acme Corp"
+
+The script will:
+1. Search web for founder information
+2. Find LinkedIn profile
+3. Check Crunchbase for company/founder history
+4. Search news and social media
+5. Compile comprehensive report with:
+   - Background & education
+   - Previous companies & exits
+   - Notable achievements
+   - Red flags (if any)
+   - Network connections
+   - Recent activity
+"""
+
+import sys
+import os
+import json
+import requests
+from datetime import datetime
+
+# Configuration
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY")
+
+if not ANTHROPIC_API_KEY:
+    print("Error: ANTHROPIC_API_KEY not set")
+    sys.exit(1)
+
+if not BRAVE_SEARCH_API_KEY:
+    print("Warning: BRAVE_SEARCH_API_KEY not set, using basic search")
+
+
+def brave_search(query, count=10):
+    """Search using Brave Search API"""
+    if not BRAVE_SEARCH_API_KEY:
+        return []
+
+    url = "https://api.search.brave.com/res/v1/web/search"
+    headers = {
+        "Accept": "application/json",
+        "X-Subscription-Token": BRAVE_SEARCH_API_KEY
+    }
+
+    params = {
+        "q": query,
+        "count": count
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+
+        if response.status_code != 200:
+            return []
+
+        data = response.json()
+        results = []
+
+        for item in data.get("web", {}).get("results", []):
+            results.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "description": item.get("description", "")
+            })
+
+        return results
+    except Exception as e:
+        print(f"Search error: {e}")
+        return []
+
+
+def call_claude(prompt, system_prompt=""):
+    """Call Claude API"""
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 8192,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+
+    if system_prompt:
+        payload["system"] = system_prompt
+
+    response = requests.post(url, headers=headers, json=payload)
+
+    if response.status_code != 200:
+        print(f"Error calling Claude API: {response.status_code}")
+        print(response.text)
+        sys.exit(1)
+
+    result = response.json()
+    return result["content"][0]["text"]
+
+
+def research_founder(founder_name, company_name=None):
+    """Conduct comprehensive founder research"""
+
+    print(f"🔍 Researching: {founder_name}")
+    if company_name:
+        print(f"   Company: {company_name}")
+    print("")
+
+    # Search queries
+    searches = [
+        f"{founder_name} founder CEO background",
+        f"{founder_name} LinkedIn",
+        f"{founder_name} previous companies startups",
+        f"{founder_name} {company_name}" if company_name else None,
+        f"{founder_name} education university",
+        f"{founder_name} funding raised investment"
+    ]
+
+    searches = [s for s in searches if s]  # Remove None
+
+    # Gather search results
+    all_results = []
+
+    for query in searches:
+        print(f"  Searching: {query[:50]}...")
+        results = brave_search(query, count=5)
+        all_results.extend(results)
+
+    print(f"✓ Found {len(all_results)} search results")
+    print("")
+
+    # Compile research data
+    research_data = {
+        "founder_name": founder_name,
+        "company_name": company_name,
+        "search_results": all_results[:30]  # Top 30 results
+    }
+
+    # Analyze with Claude
+    print("🤖 Analyzing with Claude...")
+    print("")
+
+    system_prompt = """You are an expert VC analyst conducting founder due diligence.
+Provide comprehensive, objective analysis. Flag both positive signals and red flags."""
+
+    prompt = f"""Research this founder and provide a comprehensive report:
+
+FOUNDER: {founder_name}
+{f"CURRENT COMPANY: {company_name}" if company_name else ""}
+
+SEARCH RESULTS:
+{json.dumps(research_data['search_results'], indent=2)}
+
+Create a detailed founder research report with these sections:
+
+## 📋 BASIC INFO
+- Full name & current role
+- Current company
+- Location
+- LinkedIn profile URL (if found)
+
+## 🎓 BACKGROUND & EDUCATION
+- Educational background
+- Degrees & institutions
+- Notable academic achievements
+
+## 💼 PROFESSIONAL HISTORY
+- Previous companies (founder/employee)
+- Key roles and accomplishments
+- Any exits or acquisitions
+- Years of experience in industry
+
+## 🚀 ENTREPRENEURIAL TRACK RECORD
+- Previous startups founded
+- Success/failure outcomes
+- Funding raised historically
+- Notable investors who backed them
+
+## ⭐ NOTABLE ACHIEVEMENTS
+- Awards, recognition, press
+- Patents or publications
+- Speaking engagements
+- Industry reputation
+
+## 🔗 NETWORK & CONNECTIONS
+- Well-known connections or mentors
+- Advisory roles
+- Board memberships
+- Investor relationships
+
+## 📊 CURRENT COMPANY (if applicable)
+- Company stage & traction
+- Recent funding rounds
+- Product/market
+- Team size
+
+## 🚩 RED FLAGS (if any)
+- Failed ventures with concerning patterns
+- Legal issues or controversies
+- Negative press
+- Pattern of pivot/abandonment
+- Co-founder conflicts
+
+## 🟢 GREEN FLAGS
+- Strong track record
+- Relevant domain expertise
+- Impressive co-founders or team
+- Credible investors/advisors
+- Technical/industry recognition
+
+## 📰 RECENT ACTIVITY (last 6-12 months)
+- Recent news, posts, interviews
+- Company milestones
+- Fundraising activity
+
+## 🎯 INVESTMENT PERSPECTIVE
+- Overall assessment (Strong/Moderate/Weak/Pass)
+- Key strengths
+- Key concerns
+- Questions to ask in meeting
+- Due diligence recommendations
+
+Important:
+- Be objective and balanced
+- Clearly separate facts from inference
+- Flag when information is limited or unverified
+- Highlight both strengths and weaknesses
+- Focus on signals relevant to investment decisions
+- If you can't find information on a section, say "Not found in available sources"
+
+Format in clear markdown with sections and bullet points."""
+
+    report = call_claude(prompt, system_prompt)
+
+    return report
+
+
+def main():
+    # Parse arguments
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+
+    founder_name = None
+    company_name = None
+
+    # Parse founder name and optional company
+    i = 1
+    args = []
+
+    while i < len(sys.argv):
+        if sys.argv[i] == "--company":
+            if i + 1 < len(sys.argv):
+                company_name = sys.argv[i + 1]
+                i += 2
+            else:
+                print("Error: --company requires a company name")
+                sys.exit(1)
+        else:
+            args.append(sys.argv[i])
+            i += 1
+
+    if not args:
+        print("Error: Founder name required")
+        sys.exit(1)
+
+    founder_name = ' '.join(args)
+
+    # Conduct research
+    report = research_founder(founder_name, company_name)
+
+    print("=" * 80)
+    print(report)
+    print("=" * 80)
+    print("")
+    print(f"✅ Research complete: {founder_name}")
+    print("")
+    print("💡 Next steps:")
+    print("  1. Review the report for key insights")
+    print("  2. Prepare questions based on red/green flags")
+    print("  3. Check references and network connections")
+    print("  4. Schedule deeper due diligence if promising")
+
+    # Save report to file
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = f"/tmp/founder-research-{founder_name.replace(' ', '-')}-{timestamp}.md"
+
+    try:
+        with open(filename, 'w') as f:
+            f.write(f"# Founder Research: {founder_name}\n\n")
+            if company_name:
+                f.write(f"**Company:** {company_name}\n\n")
+            f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
+            f.write("---\n\n")
+            f.write(report)
+
+        print(f"📄 Report saved: {filename}")
+    except Exception as e:
+        print(f"Warning: Could not save report: {e}")
+
+
+if __name__ == "__main__":
+    main()

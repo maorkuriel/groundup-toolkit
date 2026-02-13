@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""
+Meeting Auto-Join - Checks calendar and auto-joins upcoming meetings
+Runs via cron every 3 minutes.
+
+Checks the assistant's calendar for meetings starting in the next 5 minutes.
+If a meeting has a Google Meet link and the assistant is invited, joins it
+using Camofox browser automation. Passes event metadata so the join script
+can monitor attendance.
+"""
+import os
+import sys
+import json
+import subprocess
+import re
+from datetime import datetime, timedelta, timezone
+
+# Load shared config
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from lib.config import config
+
+GOG_ACCOUNT = config.meeting_bot_account
+JOINED_FILE = os.path.expanduser("~/.bot-joined-meetings.json")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+JOIN_SCRIPT = os.path.join(SCRIPT_DIR, "camofox-join.js")
+
+
+def log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
+def load_joined():
+    if not os.path.exists(JOINED_FILE):
+        return {}
+    try:
+        with open(JOINED_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_joined(data):
+    with open(JOINED_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def get_upcoming_meetings():
+    """Get meetings starting in the next 5 minutes"""
+    cmd = (
+        f'source "$HOME/.env" && '
+        f'gog calendar events --from today --to today '
+        f'--account {GOG_ACCOUNT} --json'
+    )
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            executable="/bin/bash", timeout=30,
+        )
+        if result.returncode != 0:
+            log(f"gog error: {result.stderr.strip()}")
+            return []
+        data = json.loads(result.stdout)
+    except Exception as e:
+        log(f"Failed to get calendar: {e}")
+        return []
+
+    events = data.get("events", [])
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(minutes=2)
+    window_end = now + timedelta(minutes=5)
+
+    upcoming = []
+    for event in events:
+        start_str = event.get("start", {}).get("dateTime", "")
+        if not start_str:
+            continue
+        try:
+            start = datetime.fromisoformat(start_str)
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            else:
+                start = start.astimezone(timezone.utc)
+        except Exception:
+            continue
+        if window_start <= start <= window_end:
+            upcoming.append(event)
+
+    return upcoming
+
+
+def extract_meet_url(event):
+    """Extract Google Meet URL from a calendar event"""
+    hangout = event.get("hangoutLink", "")
+    if hangout and "meet.google.com" in hangout:
+        return hangout
+
+    conf = event.get("conferenceData", {})
+    for entry in conf.get("entryPoints", []):
+        uri = entry.get("uri", "")
+        if "meet.google.com" in uri:
+            return uri
+
+    for field in ["description", "location"]:
+        text = event.get(field, "") or ""
+        match = re.search(r"https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}", text)
+        if match:
+            return match.group(0)
+
+    return None
+
+
+def is_already_joined(event_id):
+    """Check if we already joined this meeting today"""
+    joined = load_joined()
+    entry = joined.get(event_id)
+    if not entry:
+        return False
+    try:
+        joined_at = datetime.fromisoformat(entry["joined_at"])
+        return (datetime.now() - joined_at).total_seconds() < 12 * 3600
+    except Exception:
+        return False
+
+
+def write_meeting_metadata(event, meet_url):
+    """Write event metadata to a temp file for the join script"""
+    event_id = event.get("id", "unknown")
+    attendees = []
+    for att in event.get("attendees", []):
+        email = att.get("email", "")
+        if email.endswith("@" + config.team_domain):
+            name = email.split("@")[0].capitalize()
+            attendees.append({"email": email, "name": name})
+
+    meta = {
+        "eventId": event_id,
+        "title": event.get("summary", "Untitled"),
+        "startTime": event.get("start", {}).get("dateTime", ""),
+        "meetUrl": meet_url,
+        "attendees": attendees,
+    }
+
+    meta_path = f"/tmp/meeting-meta-{event_id}.json"
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    return meta_path
+
+
+def join_meeting(meet_url, event, event_title):
+    """Launch the Camofox join script for a meeting"""
+    event_id = event.get("id", "")
+    log(f"Joining meeting: {event_title}")
+    log(f"Meet URL: {meet_url}")
+
+    # Write metadata file for attendance monitoring
+    meta_path = write_meeting_metadata(event, meet_url)
+    log(f"Metadata written to: {meta_path}")
+
+    try:
+        proc = subprocess.Popen(
+            ["node", JOIN_SCRIPT, meet_url, meta_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=SCRIPT_DIR,
+        )
+
+        try:
+            proc.wait(timeout=15)
+            output = proc.stdout.read()
+            log(f"Join script exited early (code {proc.returncode})")
+            log(f"Output: {output[:500]}")
+            return False
+        except subprocess.TimeoutExpired:
+            log(f"Join script running (PID {proc.pid})")
+
+            joined = load_joined()
+            joined[event_id] = {
+                "joined_at": datetime.now().isoformat(),
+                "title": event_title,
+                "meet_url": meet_url,
+                "pid": proc.pid,
+            }
+            save_joined(joined)
+            return True
+
+    except Exception as e:
+        log(f"Failed to launch join script: {e}")
+        return False
+
+
+def main():
+    log("Checking for upcoming meetings...")
+
+    meetings = get_upcoming_meetings()
+    if not meetings:
+        log("No meetings in the next 5 minutes")
+        return
+
+    for event in meetings:
+        event_id = event.get("id", "")
+        title = event.get("summary", "Untitled")
+        start = event.get("start", {}).get("dateTime", "?")
+
+        if is_already_joined(event_id):
+            log(f"Already joined: {title}")
+            continue
+
+        meet_url = extract_meet_url(event)
+        if not meet_url:
+            log(f"No Meet link for: {title} (skipping)")
+            continue
+
+        log(f"Found meeting to join: {title} at {start}")
+        success = join_meeting(meet_url, event, title)
+        if success:
+            log(f"Successfully started joining: {title}")
+        else:
+            log(f"Failed to join: {title}")
+
+    log("Done")
+
+
+if __name__ == "__main__":
+    main()

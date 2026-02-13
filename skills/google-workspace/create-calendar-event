@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""
+Create a calendar event on the assistant's calendar and invite the user.
+Usage: create-calendar-event <phone_number> <title> <date> <time> [duration_minutes]
+Example: create-calendar-event +1234567890 "Team standup" 2026-02-08 12:45 30
+Or: create-calendar-event +1234567890 Team standup 2026-02-08 12:45 30 (unquoted works too)
+"""
+
+import sys
+import subprocess
+import os
+from datetime import datetime, timedelta
+import re
+
+# Load config from toolkit
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from lib.config import config
+
+# Build phone-to-email mapping from config
+PHONE_TO_EMAIL = config.team_phones  # {phone: email}
+
+def main():
+    if len(sys.argv) < 5:
+        print("Usage: create-calendar-event <phone> <title_words...> <date> <time> [duration]")
+        print('Example: create-calendar-event +1234567890 Team standup 2026-02-08 12:45 30')
+        sys.exit(1)
+
+    # First argument is phone
+    phone = sys.argv[1]
+
+    # Find date pattern (YYYY-MM-DD) in arguments
+    date = None
+    date_idx = None
+    for i, arg in enumerate(sys.argv[2:], start=2):
+        if re.match(r'\d{4}-\d{2}-\d{2}', arg):
+            date = arg
+            date_idx = i
+            break
+
+    if not date:
+        print("Error: Date (YYYY-MM-DD) not found in arguments")
+        sys.exit(1)
+
+    # Everything between phone and date is the title
+    title_parts = sys.argv[2:date_idx]
+    title = ' '.join(title_parts)
+
+    # Time is after date
+    if date_idx + 1 >= len(sys.argv):
+        print("Error: Time not provided")
+        sys.exit(1)
+
+    time = sys.argv[date_idx + 1]  # HH:MM
+
+    # Duration is optional, default 30 minutes
+    duration = 30
+    if date_idx + 2 < len(sys.argv):
+        try:
+            duration = int(sys.argv[date_idx + 2])
+        except ValueError:
+            pass  # Use default
+
+    # Get attendee email from phone
+    attendee_email = PHONE_TO_EMAIL.get(phone)
+    if not attendee_email:
+        print(f"Error: Unknown phone number {phone}")
+        sys.exit(1)
+
+    # Construct datetime strings (Israel timezone +02:00)
+    start_dt = f"{date}T{time}:00+02:00"
+
+    # Calculate end time
+    start_time = datetime.fromisoformat(start_dt.replace('+02:00', ''))
+    end_time = start_time + timedelta(minutes=duration)
+    end_dt = end_time.strftime("%Y-%m-%dT%H:%M:%S") + "+02:00"
+
+    # Set GOG environment from config
+    os.environ.setdefault("GOG_KEYRING_PASSWORD", os.getenv("GOG_KEYRING_PASSWORD", ""))
+    os.environ["GOG_ACCOUNT"] = config.assistant_email
+
+    # Build gog command
+    cmd = [
+        "gog", "calendar", "create", "primary",
+        "--summary", title,
+        "--from", start_dt,
+        "--to", end_dt,
+        "--attendees", attendee_email,
+        "--account", config.assistant_email,
+        "--json"
+    ]
+
+    print(f"Creating event: {title}")
+    print(f"For: {attendee_email}")
+    print(f"Start: {start_dt}")
+    print(f"End: {end_dt}")
+    print("")
+
+    # Execute command
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        print("Event created successfully!")
+        print(result.stdout)
+    else:
+        print("Error creating event:")
+        print(result.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

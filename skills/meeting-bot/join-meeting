@@ -1,0 +1,32 @@
+#!/bin/bash
+# Join a Google Meet meeting using Camofox
+# Usage: join-meeting <meeting-url>
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ -z "$1" ]; then
+    echo "❌ Error: No meeting URL provided"
+    echo ""
+    echo "Usage: join-meeting <meeting-url>"
+    echo ""
+    echo "Examples:"
+    echo "  join-meeting https://meet.google.com/abc-defg-hij"
+    echo "  join-meeting meet.google.com/abc-defg-hij"
+    exit 1
+fi
+
+MEETING_URL="$1"
+
+# Ensure it's a full URL
+if [[ ! "$MEETING_URL" =~ ^https:// ]]; then
+    MEETING_URL="https://$MEETING_URL"
+fi
+
+echo "🦊 Joining Google Meet with Camofox..."
+echo "Meeting: $MEETING_URL"
+echo ""
+
+cd "$SCRIPT_DIR"
+node camofox-join.js "$MEETING_URL"
