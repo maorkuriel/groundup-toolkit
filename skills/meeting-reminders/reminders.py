@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Meeting Reminder Automation - GroundUp Toolkit
-Sends WhatsApp notifications 10 minutes before each calendar meeting
+Sends WhatsApp notifications before each calendar meeting
 Enhanced with HubSpot context
 """
 
@@ -10,6 +10,8 @@ import sys
 import json
 import subprocess
 import sqlite3
+import fcntl
+import time
 import requests
 from datetime import datetime, timedelta
 import pytz
@@ -32,7 +34,13 @@ GOG_ACCOUNT = config.assistant_email
 WHATSAPP_ACCOUNT = config.whatsapp_account
 MATON_API_KEY = config.maton_api_key
 MATON_BASE_URL = "https://gateway.maton.ai/hubspot"
-DB_PATH = "/tmp/meeting-reminders.db"
+
+# Persistent database path (survives reboots, unlike /tmp)
+_TOOLKIT_ROOT = os.environ.get('TOOLKIT_ROOT', os.path.join(os.path.dirname(__file__), '..', '..'))
+_DATA_DIR = os.path.join(_TOOLKIT_ROOT, 'data')
+os.makedirs(_DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(_DATA_DIR, "meeting-reminders.db")
+LOCK_PATH = os.path.join(_DATA_DIR, "meeting-reminders.lock")
 
 # Team members with calendars and phone numbers (loaded from config)
 TEAM_MEMBERS = {}
@@ -44,9 +52,10 @@ for m in config.team_members:
         'enabled': m.get('reminders_enabled', True)
     }
 
-# Notification window: 10-15 minutes before meeting
-NOTIFICATION_WINDOW_START = 15  # minutes
-NOTIFICATION_WINDOW_END = 10    # minutes
+# Notification window: 5-20 minutes before meeting
+# Wide window (15 min) with 5-min cron ensures no meeting falls through the gap
+NOTIFICATION_WINDOW_START = 20  # minutes before meeting (far edge)
+NOTIFICATION_WINDOW_END = 5     # minutes before meeting (near edge)
 
 
 class ReminderDatabase:
@@ -152,8 +161,12 @@ def format_meeting_time(start_time_str, timezone_str):
     return local_time.strftime('%I:%M %p').lstrip('0')
 
 
-def send_whatsapp_message(phone, message, max_retries=10, retry_delay=5):
-    """Send WhatsApp message via OpenClaw with retry logic for transient disconnects"""
+def send_whatsapp_message(phone, message, max_retries=3, retry_delay=3):
+    """Send WhatsApp message via OpenClaw with retry logic.
+
+    Fail fast (3 retries, 3s delay) to avoid blocking reminders for other
+    team members. Falls back to email if all retries fail.
+    """
     for attempt in range(1, max_retries + 1):
         try:
             cmd = [
@@ -168,7 +181,7 @@ def send_whatsapp_message(phone, message, max_retries=10, retry_delay=5):
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=15
             )
 
             if result.returncode == 0:
@@ -179,7 +192,6 @@ def send_whatsapp_message(phone, message, max_retries=10, retry_delay=5):
                 print(f"  ✗ Attempt {attempt}/{max_retries} failed for {phone}: {error_msg}", file=sys.stderr)
                 if attempt < max_retries:
                     print(f"    Retrying in {retry_delay}s...", file=sys.stderr)
-                    import time
                     time.sleep(retry_delay)
                 else:
                     print(f"  ✗ All {max_retries} attempts failed for {phone}", file=sys.stderr)
@@ -187,7 +199,6 @@ def send_whatsapp_message(phone, message, max_retries=10, retry_delay=5):
         except Exception as e:
             print(f"  ✗ Attempt {attempt}/{max_retries} exception for {phone}: {e}", file=sys.stderr)
             if attempt < max_retries:
-                import time
                 time.sleep(retry_delay)
             else:
                 return False
@@ -483,12 +494,29 @@ def format_hubspot_context(context):
 
 def process_meeting_reminders():
     """Main processing function"""
+    # Acquire exclusive lock to prevent overlapping cron runs
+    lock_file = open(LOCK_PATH, 'w')
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"[{datetime.now(pytz.UTC).replace(tzinfo=None).isoformat()}] Another instance is running, skipping.")
+        return
+
+    try:
+        _do_process_meeting_reminders()
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def _do_process_meeting_reminders():
+    """Inner processing function (called under lock)"""
     print(f"[{datetime.now(pytz.UTC).replace(tzinfo=None).isoformat()}] Starting meeting reminder check...")
 
     db = ReminderDatabase(DB_PATH)
     now = datetime.now(pytz.UTC).replace(tzinfo=None)
 
-    # Check window: 10-15 minutes from now
+    # Check window: 5-20 minutes from now
     window_start = now + timedelta(minutes=NOTIFICATION_WINDOW_END)
     window_end = now + timedelta(minutes=NOTIFICATION_WINDOW_START)
 
@@ -556,9 +584,10 @@ def process_meeting_reminders():
             meeting_time = format_meeting_time(start_time, member['timezone'])
             attendee_list = format_attendees([a.get('email') for a in attendees], email)
 
-            # Build basic message
+            # Build basic message with actual minutes remaining
+            mins_away = int(round(minutes_away))
             message_lines = [
-                f"🔔 Meeting in 10 minutes:",
+                f"🔔 Meeting in ~{mins_away} minutes:",
                 f"",
                 f"📅 {summary}",
                 f"⏰ {meeting_time}",
