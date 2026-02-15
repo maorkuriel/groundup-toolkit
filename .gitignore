@@ -20,6 +20,9 @@ __pycache__/
 .venv/
 venv/
 
+# Content writer voice/business profiles (personal data)
+skills/content-writer/context/
+
 # Data & state
 data/
 *.db
