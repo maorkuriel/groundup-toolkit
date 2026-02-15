@@ -1,0 +1,40 @@
+#!/bin/bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT="$SCRIPT_DIR/radar.py"
+
+# Load environment variables
+if [ -f "$HOME/.env" ]; then
+    . "$HOME/.env"
+fi
+
+ACTION="${1:-review}"
+
+case "$ACTION" in
+    review)
+        /usr/bin/python3 "$SCRIPT" review
+        ;;
+
+    check-replies)
+        /usr/bin/python3 "$SCRIPT" check-replies
+        ;;
+
+    status)
+        /usr/bin/python3 "$SCRIPT" status
+        ;;
+
+    pass)
+        DEAL_ID="${2:-}"
+        REASON="${3:-Passed via Keep on Radar review}"
+        if [ -z "$DEAL_ID" ]; then
+            echo "Usage: keep-on-radar pass <deal_id> [reason]"
+            exit 1
+        fi
+        /usr/bin/python3 "$SCRIPT" pass "$DEAL_ID" "$REASON"
+        ;;
+
+    *)
+        echo "Usage: keep-on-radar [review|check-replies|status|pass <deal_id> [reason]]"
+        exit 1
+        ;;
+esac
