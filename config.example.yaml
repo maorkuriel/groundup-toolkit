@@ -4,7 +4,7 @@
 assistant:
   name: "Christina"                    # Your AI assistant's name
   email: "christina@yourcompany.com"   # Assistant's email account (used with gog CLI)
-  whatsapp_account: "main"             # OpenClaw WhatsApp account ID
+  whatsapp_account: "default"           # OpenClaw WhatsApp account ID
 
 team:
   domain: "yourcompany.com"            # Your company email domain
