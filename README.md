@@ -2,7 +2,6 @@
 
 An open-source automation toolkit for venture capital teams, built on [OpenClaw](https://openclaw.ai). Automates deal flow, meeting management, CRM updates, and team communication through an AI assistant connected via WhatsApp.
 
-Built and battle-tested by [GroundUp Ventures](https://groundup.vc).
 
 ## What It Does
 
